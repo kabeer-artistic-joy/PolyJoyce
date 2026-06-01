@@ -34,24 +34,34 @@ GAMMA_API         = "https://gamma-api.polymarket.com"
 CLOB_API          = "https://clob.polymarket.com"
 BINANCE_API       = "https://api.binance.com"
 
-ENTRY_SECONDS_MAX = 50
+ENTRY_SECONDS_MAX = 180
 ENTRY_SECONDS_MIN = 10
-PRICE_MIN         = {          # minimum price per crypto — BTC stricter due to higher volatility
-    "BTC": 0.94,
-    "ETH": 0.92,
+PRICE_MIN         = {          # minimum entry price — below 0.80 the outcome is still genuinely
+    "BTC":  0.80,              # uncertain (realized: <0.80 won only ~70% vs ~74% priced, -$14.58)
+    "ETH":  0.80,
+    "SOL":  0.80,
+    "XRP":  0.80,
 }
-PRICE_MAX         = 0.99   # maximum price — CLOB accepts up to 0.99
+PRICE_MAX         = 0.94   # was 0.93 — let the profitable 0.92–0.94 pocket through (+2.1pp edge)
 
-WAKE_BEFORE       = 65
+# Dead zone: realized history (May 2026, 475 trades) showed 0.85–0.92 wins ~85% but is priced
+# ~88–91% — you overpay and bleed 2–5pp of edge per trade (-$42 across the band). The only real
+# edges are 0.80–0.85 (+4.6pp, +$24) and 0.92–0.94 (+2.1pp), so skip everything in between.
+TOXIC_BAND_LOW    = 0.85
+TOXIC_BAND_HIGH   = 0.92
+
+WAKE_BEFORE       = 185
 POLL_INTERVAL     = 3
 
 # Window Delta thresholds (current price vs period-open price)
-DELTA_SKIP        = 0.0005  # < 0.05% → too close to the line, skip
+DELTA_SKIP        = 0.0010  # < 0.10% → weak/noisy; realized weight-1 entries (delta 0.05–0.10%) lost money
 DELTA_WEAK        = 0.001   # 0.05–0.10% → weak signal
 DELTA_STRONG      = 0.002   # > 0.20% → strong signal
 
 # Minimum confidence to enter (0.0 – 1.0)
-MIN_CONFIDENCE    = 0.3
+# 0.40 forces delta-weight ≥5, OR delta-weight ≥3 with momentum confirming — the only signal
+# cohort that was net-profitable in realized history (the conf-56% group: 90% win, +$0.06/trade).
+MIN_CONFIDENCE    = 0.40
 
 # ATR — volatility filter
 ATR_PERIODS       = 5     # last 5 periods of 5min
@@ -59,13 +69,19 @@ ATR_MULTIPLIER    = 1.5   # if current range > 1.5x ATR → skip
 
 # Binance symbols
 BINANCE_SYMBOLS = {
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
+    "BTC":  "BTCUSDT",
+    "ETH":  "ETHUSDT",
+    "SOL":  "SOLUSDT",
+    "XRP":  "XRPUSDT",
 }
 
+# BNB removed: realized history was -$51.54 / -6.7% ROI (82% win) across every price band —
+# thin book, noisy momentum. Dropping it alone flipped the bot from -$40.88 to +$10.67.
 MARKETS = {
-    "btc-updown-5m": "BTC",
-    "eth-updown-5m": "ETH",
+    "btc-updown-5m":  "BTC",
+    "eth-updown-5m":  "ETH",
+    "sol-updown-5m":  "SOL",
+    "xrp-updown-5m":  "XRP",
 }
 
 # ─── UTILS ─────────────────────────────────────────────────────────────────────
@@ -325,39 +341,34 @@ def get_clob_price(token_id: str) -> float:
 def execute_buy(token_id: str, amount_usdc: float, price: float,
                 private_key: str, proxy_wallet: str) -> bool:
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs
-        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.clob_types import MarketOrderArgs
+        from py_clob_client_v2.order_builder.constants import BUY
+        from py_clob_client_v2 import OrderType
 
         client = ClobClient(
             host=CLOB_API,
             key=private_key,
             chain_id=137,
-            signature_type=1,
+            signature_type=3,
             funder=proxy_wallet,
         )
-        client.set_api_creds(client.create_or_derive_api_creds())
+        client.set_api_creds(client.create_or_derive_api_key())
 
-        taker_price = min(round(price + 0.01, 4), 0.999)
-        size        = round(amount_usdc / price, 2)
-
-        # CLOB v2 minimum is 5 shares per order
-        if size < 5:
-            min_cost = round(5 * price, 2)
-            if min_cost <= amount_usdc * 1.20:
-                log(f"   Adjusted size to minimum 5 shares (cost: ${min_cost:.2f} vs budget ${amount_usdc:.2f})")
-                size = 5.0
-            else:
-                log(f"   ❌ BUY skip: {size} shares below minimum 5, would cost ${min_cost:.2f} vs budget ${amount_usdc:.2f}")
-                return False
-
-        resp = client.create_and_post_order(OrderArgs(
-            token_id=token_id,
-            price=taker_price,
-            size=size,
-            side=BUY,
-        ))
-        log(f"   ✅ BUY OK: {resp.get('status')} | order {resp.get('orderID','')[:20]}...")
+        # FAK (Fill-And-Kill): fill as much as possible immediately, cancel the rest.
+        # Better than FOK for thin alt-coin books and early-window low-price entries,
+        # where FOK kills the whole order if the full $amount can't fill at once.
+        resp = client.create_and_post_market_order(
+            order_args=MarketOrderArgs(
+                token_id=token_id,
+                amount=amount_usdc,
+                side=BUY,
+                order_type=OrderType.FAK,
+            ),
+            order_type=OrderType.FAK,
+        )
+        log(f"   ✅ BUY OK: {resp.get('status')} | order {resp.get('orderID','')[:20]}... "
+            f"filled≈${resp.get('makingAmount') or resp.get('takingAmount') or '?'}")
         return True
     except ImportError:
         raise ImportError("Install py-clob-client-v2: pip install py-clob-client-v2")
@@ -507,6 +518,11 @@ class CryptoBot:
         # Filter 1b: maximum price
         if market["winner_price"] > PRICE_MAX:
             log(f'   [{crypto}] SKIP — PM price {market["winner_price"]:.3f} > {PRICE_MAX} (minimal upside)')
+            return
+
+        # Filter 1c: dead zone — 0.85-0.92 is priced above its realized win-rate (you overpay)
+        if TOXIC_BAND_LOW <= market["winner_price"] < TOXIC_BAND_HIGH:
+            log(f'   [{crypto}] SKIP — PM price {market["winner_price"]:.3f} in toxic band [{TOXIC_BAND_LOW}, {TOXIC_BAND_HIGH})')
             return
 
         # Filter 2: minimum confidence
